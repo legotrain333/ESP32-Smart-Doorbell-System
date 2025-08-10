@@ -1,11 +1,14 @@
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_sleep.h>
 
 // Pin definitions
-#define BUTTON_PIN 7      // Doorbell button (connects to GND when pressed)
-#define LED_PIN 20        // Status LED (indicates IR light status)
-#define TRIG_PIN 15       // Ultrasonic sensor TRIG pin
-#define ECHO_PIN 18       // Ultrasonic sensor ECHO pin
+const int BUTTON_PIN = 0;      // Self-reset momentary switch (connects to GND when pressed)
+const int RGB_RED_PIN = 5;     // RGB LED Red pin (in button)
+const int RGB_GREEN_PIN = 6;   // RGB LED Green pin (in button)
+const int RGB_BLUE_PIN = 7;    // RGB LED Blue pin (in button)
+const int TRIG_PIN = 19;       // Ultrasonic sensor TRIG pin
+const int ECHO_PIN = 20;       // Ultrasonic sensor ECHO pin
 
 // Receiver MAC address (replace with your actual receiver MAC)
 uint8_t receiverMac[] = {0x9C, 0x9E, 0x6E, 0x43, 0x6E, 0xFC};
@@ -25,15 +28,47 @@ typedef struct {
 } DoorbellMessage;
 
 // State variables
-bool ledOn = false;                // True if IR light is ON (status LED ON)
+bool ledOn = false;                // True if IR light is ON (RGB LED shows status)
 unsigned long lastButtonPress = 0; // For button debounce
 const unsigned long debounceDelay = 200; // Debounce time in ms
 bool waitingForResponse = false;   // True if waiting for receiver response
 unsigned long bootTime = 0;        // For ignoring button at startup
 int previousButtonState = HIGH;    // Used for edge detection (button released)
 
+// Sleep mode variables
+unsigned long lastActivity = 0;    // Track last activity
+const unsigned long sleepTimeout = 30000; // Sleep after 30 seconds of inactivity
+bool shouldSleep = false;          // Flag to trigger sleep
+
+// Reset signal check variables
+unsigned long lastResetCheck = 0;  // Track last reset check
+const unsigned long resetCheckInterval = 5000; // Check for reset every 5 seconds
+
 // Function prototype for ESP-NOW receive callback
 void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len);
+
+// RGB LED control functions
+void setRGBColor(int red, int green, int blue) {
+  digitalWrite(RGB_RED_PIN, red > 0 ? LOW : HIGH);    // Red pin - LOW = ON, HIGH = OFF
+  digitalWrite(RGB_GREEN_PIN, green > 0 ? LOW : HIGH); // Green pin - LOW = ON, HIGH = OFF
+  digitalWrite(RGB_BLUE_PIN, blue > 0 ? LOW : HIGH);   // Blue pin - LOW = ON, HIGH = OFF
+}
+
+void turnOffRGB() {
+  setRGBColor(0, 0, 0);
+}
+
+void setRGBGreen() {
+  setRGBColor(0, 255, 0);  // Green for IR light ON
+}
+
+void setRGBRed() {
+  setRGBColor(255, 0, 0);  // Red for DND/error
+}
+
+void setRGBBlue() {
+  setRGBColor(0, 0, 255);  // Blue for testing
+}
 
 // Function to wake up and reinitialize
 void wakeUpAndInitialize() {
@@ -47,7 +82,7 @@ void wakeUpAndInitialize() {
   }
 
   esp_now_register_recv_cb(onDataRecv);
-
+  
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, receiverMac, 6);
   peerInfo.channel = 0;
@@ -68,10 +103,23 @@ void setup() {
 
   // Initialize hardware pins
   pinMode(BUTTON_PIN, INPUT_PULLUP); // Button to GND, uses internal pull-up
-  pinMode(LED_PIN, OUTPUT);
+  pinMode(RGB_RED_PIN, OUTPUT);
+  pinMode(RGB_GREEN_PIN, OUTPUT);
+  pinMode(RGB_BLUE_PIN, OUTPUT);
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
+  // Test RGB LED sequence to verify it's working
+  Serial.println("Testing RGB LED...");
+  setRGBRed();
+  delay(500);
+  setRGBGreen();
+  delay(500);
+  setRGBBlue();
+  delay(500);
+  turnOffRGB();
+  Serial.println("RGB LED test complete");
+  
   // Check if we're waking up from deep sleep
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   
@@ -83,13 +131,13 @@ void setup() {
     wakeUpAndInitialize();
   } else {
     // First boot - initialize normally
-    WiFi.mode(WIFI_STA);
-    if (esp_now_init() != ESP_OK) {
-      Serial.println("ESP-NOW init failed");
-      while (1);
-    }
-    Serial.println("ESP-NOW initialized.");
-    esp_now_register_recv_cb(onDataRecv);
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (1);
+  }
+  Serial.println("ESP-NOW initialized.");
+  esp_now_register_recv_cb(onDataRecv);
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, receiverMac, 6);
     peerInfo.channel = 0;  
@@ -99,6 +147,8 @@ void setup() {
   }
 
   bootTime = millis();  // Track boot time for startup ignore
+  lastActivity = millis(); // Initialize activity timer
+  lastResetCheck = millis(); // Initialize reset check timer
 }
 
 void loop() {
@@ -106,6 +156,34 @@ void loop() {
   if (millis() - bootTime < 1000) {
     previousButtonState = digitalRead(BUTTON_PIN);  // Keep updating to avoid false edge detection
     return;
+  }
+
+  // Periodic reset signal check (every 5 seconds)
+  if (millis() - lastResetCheck > resetCheckInterval) {
+    lastResetCheck = millis();
+    // ESP-NOW callback will handle any incoming reset signals
+    // This just ensures we're actively listening
+  }
+
+  // Check if we should go to light sleep (can still receive ESP-NOW messages)
+  if (!waitingForResponse && !ledOn && (millis() - lastActivity > sleepTimeout)) {
+    Serial.println("No activity for 30 seconds. Going to light sleep...");
+    Serial.println("Press button to wake up or wait for reset signal.");
+    
+    // Turn off RGB LED
+    turnOffRGB();
+    
+    // Light sleep - can still receive ESP-NOW messages
+    esp_light_sleep_start();
+    
+    // After waking from light sleep, check if it was from button press
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+      Serial.println("Woke up from button press");
+      lastActivity = millis(); // Reset activity timer
+    } else {
+      Serial.println("Woke up from other source (possibly reset signal)");
+    }
   }
 
   int currentButtonState = digitalRead(BUTTON_PIN);
@@ -124,27 +202,36 @@ void loop() {
     lastButtonDebug = millis();
   }
 
-  // Detect falling edge (HIGH to LOW) with debounce
+    // Detect falling edge (HIGH to LOW) with debounce
   // Only trigger when button is pressed after being released
   if (previousButtonState == HIGH && currentButtonState == LOW &&
       millis() - lastButtonPress > debounceDelay && !waitingForResponse) {
     lastButtonPress = millis();
     Serial.println("=== BUTTON PRESSED ===");
+    
+    // Check if door is already open before sending request
+    if (doorOpened()) {
+      Serial.println("Door is already open. Not sending DOORBELL_REQUEST.");
+      return;
+    }
+    
     Serial.println("Button pressed. Sending DOORBELL_REQUEST.");
     sendDoorbellRequest();
     waitingForResponse = true;
+    lastActivity = millis(); // Update activity timer
   }
 
   previousButtonState = currentButtonState;
 
-  // If LED is ON, check for door open (ultrasonic)
-  // Only send DOOR_OPEN_SIGNAL if IR light is ON (LED ON)
+    // Only check door status when LED is GREEN (waiting for door to open)
+  // Don't check during red blink or when LED is off
   if (ledOn && doorOpened()) {
     Serial.println("Door opened detected by ultrasonic. Sending DOOR_OPEN_SIGNAL.");
     sendDoorOpenSignal();
     ledOn = false;
-    digitalWrite(LED_PIN, LOW);
-    Serial.println("LED turned OFF after door opened.");
+    turnOffRGB();
+    Serial.println("RGB LED turned OFF after door opened.");
+    lastActivity = millis(); // Update activity timer
   }
 }
 
@@ -181,19 +268,22 @@ void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
   switch (msg.type) {
     case LIGHT_ON_CONFIRM:
       ledOn = true;
-      digitalWrite(LED_PIN, HIGH);
-      Serial.println("LIGHT_ON_CONFIRM received. LED turned ON.");
+      setRGBGreen();  // Green for IR light ON
+      Serial.println("LIGHT_ON_CONFIRM received. RGB LED turned GREEN.");
       waitingForResponse = false;
+      lastActivity = millis(); // Update activity timer
       break;
     case DND_RESPONSE:
-      Serial.println("DND_RESPONSE received. Blinking LED 5 times.");
-      blinkLED(5);
+      Serial.println("DND_RESPONSE received. Blinking RED LED 5 times.");
+      blinkRedLED(5);
       waitingForResponse = false;
+      lastActivity = millis(); // Update activity timer
       break;
     case RESET_SIGNAL:
       ledOn = false;
-      digitalWrite(LED_PIN, LOW);
-      Serial.println("RESET_SIGNAL received. LED turned OFF.");
+      turnOffRGB();
+      Serial.println("RESET_SIGNAL received. RGB LED turned OFF.");
+      lastActivity = millis(); // Update activity timer
       break;
     default:
       Serial.println("Unknown message type received.");
@@ -201,15 +291,15 @@ void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
   }
 }
 
-// Blink LED n times (used for DND denial feedback)
-void blinkLED(int n) {
+// Blink RED LED n times (used for DND denial feedback)
+void blinkRedLED(int n) {
   for (int i = 0; i < n; i++) {
-    digitalWrite(LED_PIN, HIGH);
+    setRGBRed();
     delay(200);
-    digitalWrite(LED_PIN, LOW);
+    turnOffRGB();
     delay(200);
   }
-  Serial.print("LED blinked ");
+  Serial.print("RED LED blinked ");
   Serial.print(n);
   Serial.println(" times.");
 }

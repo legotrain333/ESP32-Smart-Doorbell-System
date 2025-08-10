@@ -2,10 +2,9 @@
 #include <WiFi.h>
 #include <EEPROM.h>
 
-// Pin definitions
-#define DND_BUTTON_PIN 19   // DND button GPIO
-#define RESET_BUTTON_PIN 18 // RESET button GPIO
-#define DND_LED_PIN 2       // Onboard status LED (optional)
+const int DND_BUTTON_PIN = 15;   // DND button GPIO (self-reset momentary switch with LED)
+const int RESET_BUTTON_PIN = 20; // RESET button GPIO
+const int DND_LED_PIN = 19;      // LED control for DND switch
 
 // MAC addresses
 uint8_t senderMac[] = {0x9C, 0x9E, 0x6E, 0x43, 0x8A, 0xF0};
